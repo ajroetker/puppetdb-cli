@@ -1,6 +1,14 @@
 #include <stdio.h>
 #include <curl/curl.h>
+#include <curl/multi.h>
 #include <string>
+#include <queue>
+#include <mutex>
+#include <thread>
+#include <condition_variable>
+
+#include <rapidjson/reader.h>
+#include <rapidjson/prettywriter.h>
 
 #include <boost/nowide/iostream.hpp>
 #include <boost/nowide/args.hpp>
@@ -106,7 +114,25 @@ PuppetDBConn::parseServerUrls(const json::JsonContainer& config) {
     }
 }
 
-size_t write_data(void *ptr, size_t size, size_t nmemb, FILE *stream) {
+class JsonQueue {
+  public:
+    condition_variable cv;
+    mutex cv_m;
+    queue<int> q;
+};
+
+size_t write_queue(char *ptr, size_t size, size_t nmemb, JsonQueue& stream) {
+    const size_t written = size * nmemb;
+    unique_lock<mutex> lk(stream.cv_m);
+    for (size_t i = 0; i < written; i++) {
+        stream.q.push(ptr[i]);
+    }
+    lk.unlock();
+    stream.cv.notify_one();
+    return written;
+}
+
+size_t write_data(char *ptr, size_t size, size_t nmemb, FILE *stream) {
     const size_t written = fwrite(ptr, size, nmemb, stream);
     return written;
 }
@@ -115,6 +141,72 @@ size_t write_body(char *ptr, size_t size, size_t nmemb, void *userdata){
     return size * nmemb;
 }
 
+
+class IStreamWrapper {
+  public:
+    typedef char Ch;
+    IStreamWrapper(JsonQueue& is) : is_(is) {}
+    Ch Peek() const { // 1
+        int c = Front();
+        return c == char_traits<char>::eof() ? '\0' : (Ch)c;
+    }
+    Ch Take() { // 2
+        int c = Get();
+        return c == char_traits<char>::eof() ? '\0' : (Ch)c;
+    }
+    size_t Tell() const { return (size_t)is_.q.size(); } // 3
+    Ch* PutBegin() { assert(false); return 0; }
+    void Put(Ch) { assert(false); }
+    void Flush() { assert(false); }
+    size_t PutEnd(Ch*) { assert(false); return 0; }
+  private:
+    int Front() const {
+        unique_lock<mutex> lk(is_.cv_m);
+        is_.cv.wait(lk, [&]{ return !is_.q.empty(); });
+        int c = is_.q.front();
+        lk.unlock();
+        return c;
+    };
+    int Get() {
+        unique_lock<mutex> lk(is_.cv_m);
+        is_.cv.wait(lk, [&]{ return !is_.q.empty(); });
+        int c = is_.q.front();
+        is_.q.pop();
+        lk.unlock();
+        return c;
+    };
+    IStreamWrapper(const IStreamWrapper&);
+    IStreamWrapper& operator=(const IStreamWrapper&);
+    JsonQueue& is_;
+};
+
+class OStreamWrapper {
+  public:
+    typedef char Ch;
+    OStreamWrapper(std::ostream& os) : os_(os) {
+    }
+    Ch Peek() const { assert(false); return '\0'; }
+    Ch Take() { assert(false); return '\0'; }
+    size_t Tell() const { return 0; }
+    Ch* PutBegin() { assert(false); return 0; }
+    void Put(Ch c) { os_.put(c); }                  // 1
+    void Flush() { os_.flush(); }                   // 2
+    size_t PutEnd(Ch*) { assert(false); return 0; }
+  private:
+    OStreamWrapper(const OStreamWrapper&);
+    OStreamWrapper& operator=(const OStreamWrapper&);
+    std::ostream& os_;
+};
+
+void pretty(JsonQueue& q) {
+    rapidjson::Reader reader;
+    IStreamWrapper is(q);
+    OStreamWrapper os(nowide::cout);
+    rapidjson::PrettyWriter<OStreamWrapper> writer(os);
+    if (!reader.Parse<rapidjson::kParseValidateEncodingFlag>(is, writer)) {
+        nowide::cerr << "error parsing response" << endl;
+    }
+};
 void
 pdb_query(const PuppetDBConn& conn,
           const string& query_str) {
@@ -127,17 +219,70 @@ pdb_query(const PuppetDBConn& conn,
             + "/pdb/query/v4?query="
             + url_encoded_query.get();
 
+    JsonQueue q;
     curl_easy_setopt(curl.get(), CURLOPT_URL, server_url.c_str());
-    curl_easy_setopt(curl.get(), CURLOPT_WRITEDATA, stdout);
-    curl_easy_setopt(curl.get(), CURLOPT_WRITEFUNCTION, write_data);
+    curl_easy_setopt(curl.get(), CURLOPT_WRITEDATA, &q);
+    curl_easy_setopt(curl.get(), CURLOPT_WRITEFUNCTION, write_queue);
 
-    const CURLcode curl_code = curl_easy_perform(curl.get());
-    long http_code = 0;
-    curl_easy_getinfo(curl.get(), CURLINFO_RESPONSE_CODE, &http_code);
-    if (!(http_code == 200 && curl_code == CURLE_OK)) {
-        logging::colorize(nowide::cerr, logging::log_level::fatal);
-        nowide::cerr << "error: " << curl_easy_strerror(curl_code) << endl;
-        logging::colorize(nowide::cerr);
+    auto curlm = unique_ptr< CURLM, function<void(CURLM*)> >(curl_multi_init(),
+                                                             curl_multi_cleanup);
+    curl_multi_add_handle(curlm.get(), curl.get());
+
+    int still_running=0;
+    curl_multi_perform(curlm.get(), &still_running);
+
+    thread t1(pretty, ref(q));
+
+    do {
+        int numfds=0;
+        int res = curl_multi_wait(curlm.get(), NULL, 0, 30000, &numfds);
+        if(res != CURLM_OK) {
+            nowide::cerr << "error: curl_multi_wait() returned " << res << endl;
+            return;
+        }
+        /*
+         if(!numfds) {
+            fprintf(stderr, "error: curl_multi_wait() numfds=%d\n", numfds);
+            return EXIT_FAILURE;
+         }
+        */
+        curl_multi_perform(curlm.get(), &still_running);
+
+    } while(still_running);
+
+    q.q.push(char_traits<char>::eof());
+    q.cv.notify_one();
+    t1.join();
+
+    CURL *eh=NULL;
+    CURLMsg *msg=NULL;
+    CURLcode return_code;
+    int msgs_left=0;
+    while ((msg = curl_multi_info_read(curlm.get(), &msgs_left))) {
+        if (msg->msg == CURLMSG_DONE) {
+            eh = msg->easy_handle;
+
+            return_code = msg->data.result;
+            if(return_code!=CURLE_OK) {
+                nowide::cerr << "CURL error code: " << msg->data.result << endl;
+                continue;
+            }
+
+            // Get HTTP status code
+            long http_status_code=0;
+            curl_easy_getinfo(eh, CURLINFO_RESPONSE_CODE, &http_status_code);
+
+            if (http_status_code!=200) {
+                logging::colorize(nowide::cerr, logging::log_level::fatal);
+                nowide::cerr << "error: " << curl_easy_strerror(return_code) << endl;
+                logging::colorize(nowide::cerr);
+            }
+
+            curl_multi_remove_handle(curlm.get(), eh);
+        }
+        else {
+            nowide::cerr << "error: after curl_multi_info_read(), CURLMsg=" << msg->msg << endl;
+        }
     }
 }
 

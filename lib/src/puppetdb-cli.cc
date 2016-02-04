@@ -207,10 +207,13 @@ void pretty(JsonQueue& q) {
         nowide::cerr << "error parsing response" << endl;
     }
 };
+
+
 void
 pdb_query(const PuppetDBConn& conn,
           const string& query_str) {
     auto curl = conn.getCurlHandle();
+
     auto url_encoded_query = unique_ptr< char, function<void(char*)> >(
         curl_easy_escape(curl.get(), query_str.c_str(), query_str.length()),
         curl_free);
@@ -224,65 +227,17 @@ pdb_query(const PuppetDBConn& conn,
     curl_easy_setopt(curl.get(), CURLOPT_WRITEDATA, &q);
     curl_easy_setopt(curl.get(), CURLOPT_WRITEFUNCTION, write_queue);
 
-    auto curlm = unique_ptr< CURLM, function<void(CURLM*)> >(curl_multi_init(),
-                                                             curl_multi_cleanup);
-    curl_multi_add_handle(curlm.get(), curl.get());
-
-    int still_running=0;
-    curl_multi_perform(curlm.get(), &still_running);
-
     thread t1(pretty, ref(q));
-
-    do {
-        int numfds=0;
-        int res = curl_multi_wait(curlm.get(), NULL, 0, 30000, &numfds);
-        if(res != CURLM_OK) {
-            nowide::cerr << "error: curl_multi_wait() returned " << res << endl;
-            return;
-        }
-        /*
-         if(!numfds) {
-            fprintf(stderr, "error: curl_multi_wait() numfds=%d\n", numfds);
-            return EXIT_FAILURE;
-         }
-        */
-        curl_multi_perform(curlm.get(), &still_running);
-
-    } while(still_running);
-
+    const CURLcode curl_code = curl_easy_perform(curl.get());
     q.q.push(char_traits<char>::eof());
     q.cv.notify_one();
     t1.join();
-
-    CURL *eh=NULL;
-    CURLMsg *msg=NULL;
-    CURLcode return_code;
-    int msgs_left=0;
-    while ((msg = curl_multi_info_read(curlm.get(), &msgs_left))) {
-        if (msg->msg == CURLMSG_DONE) {
-            eh = msg->easy_handle;
-
-            return_code = msg->data.result;
-            if(return_code!=CURLE_OK) {
-                nowide::cerr << "CURL error code: " << msg->data.result << endl;
-                continue;
-            }
-
-            // Get HTTP status code
-            long http_status_code=0;
-            curl_easy_getinfo(eh, CURLINFO_RESPONSE_CODE, &http_status_code);
-
-            if (http_status_code!=200) {
-                logging::colorize(nowide::cerr, logging::log_level::fatal);
-                nowide::cerr << "error: " << curl_easy_strerror(return_code) << endl;
-                logging::colorize(nowide::cerr);
-            }
-
-            curl_multi_remove_handle(curlm.get(), eh);
-        }
-        else {
-            nowide::cerr << "error: after curl_multi_info_read(), CURLMsg=" << msg->msg << endl;
-        }
+    long http_code = 0;
+    curl_easy_getinfo(curl.get(), CURLINFO_RESPONSE_CODE, &http_code);
+    if (!(http_code == 200 && curl_code == CURLE_OK)) {
+        logging::colorize(nowide::cerr, logging::log_level::fatal);
+        nowide::cerr << "error: " << curl_easy_strerror(curl_code) << endl;
+        logging::colorize(nowide::cerr);
     }
 }
 

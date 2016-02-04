@@ -1,6 +1,5 @@
 #include <stdio.h>
 #include <curl/curl.h>
-#include <curl/multi.h>
 #include <string>
 #include <queue>
 #include <mutex>
@@ -119,6 +118,9 @@ class JsonQueue {
     condition_variable cv;
     mutex cv_m;
     queue<int> q;
+  private:
+    JsonQueue(const JsonQueue&);
+    JsonQueue& operator=(const JsonQueue&);
 };
 
 size_t write_queue(char *ptr, size_t size, size_t nmemb, JsonQueue& stream) {
@@ -142,10 +144,10 @@ size_t write_body(char *ptr, size_t size, size_t nmemb, void *userdata){
 }
 
 
-class IStreamWrapper {
+class JsonQueueWrapper {
   public:
     typedef char Ch;
-    IStreamWrapper(JsonQueue& is) : is_(is) {}
+    JsonQueueWrapper(JsonQueue& stream) : stream_(stream) {}
     Ch Peek() const { // 1
         int c = Front();
         return c == char_traits<char>::eof() ? '\0' : (Ch)c;
@@ -154,30 +156,30 @@ class IStreamWrapper {
         int c = Get();
         return c == char_traits<char>::eof() ? '\0' : (Ch)c;
     }
-    size_t Tell() const { return (size_t)is_.q.size(); } // 3
+    size_t Tell() const { return (size_t)stream_.q.size(); } // 3
     Ch* PutBegin() { assert(false); return 0; }
     void Put(Ch) { assert(false); }
     void Flush() { assert(false); }
     size_t PutEnd(Ch*) { assert(false); return 0; }
   private:
     int Front() const {
-        unique_lock<mutex> lk(is_.cv_m);
-        is_.cv.wait(lk, [&]{ return !is_.q.empty(); });
-        int c = is_.q.front();
+        unique_lock<mutex> lk(stream_.cv_m);
+        stream_.cv.wait(lk, [&]{ return !stream_.q.empty(); });
+        int c = stream_.q.front();
         lk.unlock();
         return c;
     };
     int Get() {
-        unique_lock<mutex> lk(is_.cv_m);
-        is_.cv.wait(lk, [&]{ return !is_.q.empty(); });
-        int c = is_.q.front();
-        is_.q.pop();
+        unique_lock<mutex> lk(stream_.cv_m);
+        stream_.cv.wait(lk, [&]{ return !stream_.q.empty(); });
+        int c = stream_.q.front();
+        stream_.q.pop();
         lk.unlock();
         return c;
     };
-    IStreamWrapper(const IStreamWrapper&);
-    IStreamWrapper& operator=(const IStreamWrapper&);
-    JsonQueue& is_;
+    JsonQueueWrapper(const JsonQueueWrapper&);
+    JsonQueueWrapper& operator=(const JsonQueueWrapper&);
+    JsonQueue& stream_;
 };
 
 class OStreamWrapper {
@@ -198,9 +200,9 @@ class OStreamWrapper {
     std::ostream& os_;
 };
 
-void pretty(JsonQueue& q) {
+void write_pretty(JsonQueue& q) {
     rapidjson::Reader reader;
-    IStreamWrapper is(q);
+    JsonQueueWrapper is(q);
     OStreamWrapper os(nowide::cout);
     rapidjson::PrettyWriter<OStreamWrapper> writer(os);
     if (!reader.Parse<rapidjson::kParseValidateEncodingFlag>(is, writer)) {

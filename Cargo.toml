@@ -1,3 +1,9 @@
+[profile.release]
+rpath = true
+
+[profile.dev]
+rpath = true
+
 [package]
 name = "puppetdb"
 version = "1.1.0"

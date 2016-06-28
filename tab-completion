@@ -1,0 +1,29 @@
+# file: tab-completion
+# puppet-query parameter-completion
+
+_puppet-query ()   #  By convention, the function name
+{               #+ starts with an underscore.
+  local cur
+  # Pointer to current completion word.
+  # By convention, it's named "cur" but this isn't strictly necessary.
+
+  COMPREPLY=()   # Array variable storing the possible completions.
+  cur=${COMP_WORDS[COMP_CWORD]}
+
+  case "$cur" in
+    -*)
+    COMPREPLY=( $( compgen -W '--help --version --config' -- $cur ) );;
+    *)
+    #COMPREPLY=( $( compgen -W 'nodes facts reports') );;
+    COMPREPLY=( $( ./target/debug/pql $cur ) );;
+#   Generate the completion matches and load them into $COMPREPLY array.
+#   xx) May add more cases here.
+#   yy)
+#   zz)
+  esac
+
+  return 0
+}
+
+complete -F _puppet-query -o filenames puppet-query
+#        ^^ ^^^^^^^^^^^^  Invokes the function _puppet-query.

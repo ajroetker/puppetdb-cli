@@ -21,12 +21,17 @@ path = "src/db.rs"
 name = "puppet-query"
 path = "src/query.rs"
 
+[[bin]]
+name = "pql"
+path = "src/pql.rs"
+
 [dependencies]
 beautician = "0.1"
 hyper = "0.8"
 docopt = "0.6"
 rustc-serialize = "0.3"
 url = "0.5"
+regex = "0.1"
 
 [dependencies.openssl]
 version = "0.7"
